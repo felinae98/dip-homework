@@ -63,13 +63,13 @@ public:
     struct parameters {
     };
 protected:
-    Matrix                         Tr_delta;   // transformation (previous -> current frame)  
+    Matrix                         Tr_delta;   // 姿态变换
     bool                           Tr_valid;   // 是否存在预测的下一帧
     Matcher                       *matcher;    // feature matcher
     std::vector<int32_t>           inliers;    // 内围点
     double                        *J;          // 雅克比行列式
-    double                        *p_observe;  // observed 2d points
-    double                        *p_predict;  // predicted 2d points
+    double                        *p_observe;  // 观测点的二维坐标
+    double                        *p_predict;  // 预测点的二维坐标
     std::vector<Matcher::p_match>  p_matched;  // feature point matches
     
 private:
@@ -87,10 +87,9 @@ class VisualOdometryStereo {
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 bool VisualOdometryStereo::process (uint8_t *I1,uint8_t *I2,int32_t* dims,bool replace) {
 
-    // push back images
     matcher->pushBack(I1,I2,dims,replace);
+    // 把左右两帧图片加入ringbuffer，并计算特征值
     
-    // bootstrap motion estimate if invalid
     // 如果是处理第一张图片就先建立动作预测
     if (!Tr_valid) {
         matcher->matchFeatures(2);
@@ -99,12 +98,14 @@ bool VisualOdometryStereo::process (uint8_t *I1,uint8_t *I2,int32_t* dims,bool r
         updateMotion();
     }
     
-    // match features and update motion
     if (Tr_valid) matcher->matchFeatures(2,&Tr_delta);
     else          matcher->matchFeatures(2);
+    // 使用环形匹配法匹配图像特征
     matcher->bucketFeatures(param.bucket.max_features,param.bucket.bucket_width,param.bucket.bucket_height);                          
+    // 减少特征数量，并使特征值较为均匀的分布在图像中
     p_matched = matcher->getMatches();
     return updateMotion();
+    // 更新动作
 }
         
     \end{minted}
@@ -215,16 +216,15 @@ void Matcher::matchFeatures(int32_t method, Matrix *Tr_delta) {
     // double pass matching
     if (param.multi_stage) {
 
-        // 1st pass (sparse matches)
+        // 1st pass 稀疏特征匹配
         matching(m1p1,m2p1,m1c1,m2c1,n1p1,n2p1,n1c1,n2c1,p_matched_1,method,false,Tr_delta);
         // 使用2d Delaunay三角剖分消除异常值
         removeOutliers(p_matched_1,method);
         
-        // compute search range prior statistics (used for speeding up 2nd pass)
         // 为加速第二次处理计算搜索范围优先级数据
         computePriorStatistics(p_matched_1,method);      
 
-        // 2nd pass (dense matches)
+        // 2nd pass 稠密特征匹配
         matching(m1p2,m2p2,m1c2,m2c2,n1p2,n2p2,n1c2,n2c2,p_matched_2,method,true,Tr_delta);
         if (param.refinement>0)
             // 通过抛物线拟合的子像素细化来进一步改进特征定位
@@ -233,10 +233,7 @@ void Matcher::matchFeatures(int32_t method, Matrix *Tr_delta) {
 
     // single pass matching
     } else {
-        matching(m1p2,m2p2,m1c2,m2c2,n1p2,n2p2,n1c2,n2c2,p_matched_2,method,false,Tr_delta);
-        if (param.refinement>0)
-        refinement(p_matched_2,method);
-        removeOutliers(p_matched_2,method);
+        ...
     }
 }
     \end{minted}
@@ -329,14 +326,10 @@ void Matcher::matching (int32_t *m1p,int32_t *m2p,int32_t *m1c,int32_t *m2c,
             else
                 findMatch(m1c,i1c,m1p,step_size,k1p,u_bin_num,v_bin_num,stat_bin,i1p2,3,true ,use_prior);
             // 匹配”当前帧“左侧图像和”前一帧“右侧图像
-            // circle closure success?
             if (i1p2==i1p) {
 
-                // extract coordinates
                 u2c = *(m2c+step_size*i2c+0); v2c = *(m2c+step_size*i2c+1);
                 u1c = *(m1c+step_size*i1c+0); v1c = *(m1c+step_size*i1c+1);
-
-                // if disparities are positive
                 if (u1p>=u2p && u1c>=u2c) {
                 
                     // 如果匹配成功，就把匹配的结果放入p_match中
@@ -430,7 +423,6 @@ void Matcher::computePriorStatistics (vector<Matcher::p_match> &p_matched,int32_
         if (method<2) {
             ...
         
-        // quad matching: use current previous image as reference
         } else {
             u_bin_min = min(max((int32_t)floor(it->u1p/(float)param.match_binsize)-1,0),u_bin_num-1);
             u_bin_max = min(max((int32_t)floor(it->u1p/(float)param.match_binsize)+1,0),u_bin_num-1);
@@ -672,7 +664,6 @@ VisualOdometryStereo::result VisualOdometryStereo::updateParameters(vector<Match
     }
 }
     \end{minted}
-    \section{实验运行结果}
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 vector<int32_t> VisualOdometryStereo::getInlier(vector<Matcher::p_match> &p_matched,vector<double> &tr) {
 
@@ -707,4 +698,5 @@ Matrix VisualOdometry::transformationVectorToMatrix (vector<double> tr) {
     return Tr;
 }
     \end{minted}
+    \section{实验运行结果}
 \end{document}
