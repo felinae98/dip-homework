@@ -1,5 +1,10 @@
 \documentclass[UTF8]{ctexart}
 \usepackage{minted}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{subfigure}
+\usepackage{geometry}
+\geometry{a4paper, scale=0.8}
 \title{Visual Odomentry代码阅读报告}
 \author{唐誉铭}
 \date{\today}
@@ -7,9 +12,286 @@
 	\maketitle
 	\section{论文概要}
 	\subsection{论文要解决的问题}
-	论文中提出了一种基于双镜摄像头拍摄的视频进行三维重建的方法。3D感知是计算机视觉和机器人技术的核心课题之一。在实践中，相机的分辨率严重受限，并且对生成结果的准确性有着较高的要求，
+    论文中提出了一种基于双镜摄像头拍摄的视频进行三维重建的方法。3D感知是计算机视觉和机器人技术的核心课题之一。
+    在实践中，相机的分辨率严重受限，并且对生成结果的准确性有着较高的要求。并且，该实时系统要求很高的计算性能
+    ，很多嵌入式设备不能提供那么高的计算性能，特别是无法使用FPGA的情况下。
+
+    论文中提到的处理方法实现了可以运行数千个特征点匹配的实时场景计算，一种简单而快速的视觉测距算法并且能推算出拍摄主体的自我运动。
+    \subsection{论文采用的主要方法}
+    在处理过程中，程序每次读入一帧左右两张图片，把图片加入ringbuffer中，并且用图1两种滤波器检测特征。
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.6\textwidth]{img/filter.png} 
+        \caption{采用的滤波器}
+        \label{fig.1}
+    \end{figure}
+    分别求取结果较少的稀疏特征值和结果比较多的稠密特征值，并且分别用非极大值抑制和非极小值抑制处理得到的结果。
+
+    下面的步骤是稀疏特征值匹配，首先对图像分成各个区域（bin）对每个特征点使用“环形匹配”，既先对于“前一帧”的左视图的每一个点，
+    在“前一帧”右视图相似的位置找到对应的特征点，再找到该对应特征点在“当前帧”右视图对应的特征点，再寻找“当前帧”左视图对应的特征点，
+    最后寻找“上一帧”左视图中的特征点对应的“当前帧”左视图对应的特征点。如果最后找到的特征点就是初始特征点，则“环形匹配”成功，否则失败。
+    过程如图2,3所示。
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.75\textwidth]{img/CircleMatch.png}
+        \caption{环形匹配过程}
+        \label{fig.2}
+    \end{figure}
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.75\textwidth]{img/CircleMatchOrNot.png}
+        \caption{环形匹配是否成功}
+        \label{fig.3}
+    \end{figure}
+    对匹配的结果使用2d Delaunay三角剖分来消去异常值，接下来对每一个匹配进行分析，统计每一个匹配完成的特征
+    点在另外三张图的偏移距离大小，从而计算出每一个区域（bin）偏移范围，通过偏移范围确定下次稠密特征匹配的搜索范围。
+
+    然后进行一次稠密点特征“环形匹配”，与稀疏特征匹配不同的是，后者的搜索范围是人工规定的比较大的区域
+    ，而前者的搜索范围是由后者统计出偏移范围决定的。然后通过抛物线拟合的子像素细化来进一步改进特征定位，再使用三角剖分去除异常值。
+
+    对匹配完成的结果再进行“桶”操作，把图像分为若干个桶，每个桶只随机保留若干个特征点，这样保证了特征点数量不会过多，并且较为
+    均匀的分布在整个图像上。
+
+    完成特征匹配后再进行动作推测。论文中提到的方法使用了RANSAC算法。在每轮RANSAC算法中，先随机选择3个点作为初始点，对这3个点建立动作预测模型，
+    迭代求算出最优的位置调整参数，然后对所有特征点使用该动作预测模型，观测值与预测值只差小于某个阈值的特征点被标记为inlier，inlier越多代表
+    模型越好，如果下一个模型的inlier数量比当前多，就更新模型。
 	\section{代码分析}
-    \subsection{整体流程分析}
+    \subsection{主要类以及数据结构分析}
+    \subsubsection{VisualOdometryStereo}
+    主要功能类，包括动作预测，动作参数计算等功能
+    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
+class VisualOdometryStereo : public VisualOdometry {
+
+public:
+
+    struct parameters : public VisualOdometry::parameters {
+        // 相关参数
+        double  base;             // baseline (meters)
+        int32_t ransac_iters;     // RANSAC迭代次数
+        double  inlier_threshold; // inlier要求的偏差阈值
+        bool    reweighting;      
+    };
+
+    bool process (uint8_t *I1,uint8_t *I2,int32_t* dims,bool replace=false);
+    // 主要处理函数，读入两张照片
+
+    using VisualOdometry::process;
+
+
+
+private:
+
+    std::vector<double>  estimateMotion (std::vector<Matcher::p_match> p_matched);
+    // 预测动作
+    enum                 result { UPDATED, FAILED, CONVERGED };  
+    result               updateParameters(std::vector<Matcher::p_match> &p_matched,std::vector<int32_t> &active,std::vector<double> &tr,double step_size,double eps);
+    // 更新动作变化参数
+    void                 computeObservations(std::vector<Matcher::p_match> &p_matched,std::vector<int32_t> &active);
+    void                 computeResidualsAndJacobian(std::vector<double> &tr,std::vector<int32_t> &active);
+    // 计算相关参数
+    std::vector<int32_t> getInlier(std::vector<Matcher::p_match> &p_matched,std::vector<double> &tr);
+    // 计算inliers（内群点）
+
+    double *X,*Y,*Z;    // 3d points
+    double *p_residual; // residuals (p_residual=p_observe-p_predict)
+    
+    // parameters
+    parameters param;
+};
+    \end{minted}
+    \subsubsection{VisualOdometry}
+    VisualOdometryStereo的基类
+    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
+class VisualOdometry {
+
+public:
+
+    // 镜头相关参数
+    struct calibration {  
+        double f;  // focal length (in pixels)
+        double cu; // principal point (u-coordinate)
+        double cv; // principal point (v-coordinate)
+        calibration () {
+            ...
+        }
+    };
+    
+    // “桶”操作参数
+    struct bucketing {  
+        int32_t max_features;  // maximal number of features per bucket 
+        double  bucket_width;  // width of bucket
+        double  bucket_height; // height of bucket
+        bucketing () {
+            ...
+        }
+    };
+    
+    // general parameters
+    struct parameters {
+        Matcher::parameters         match;            // matching parameters
+        VisualOdometry::bucketing   bucket;           // bucketing parameters
+        VisualOdometry::calibration calib;            // camera calibration parameters
+    };
+
+
+    // returns previous to current feature matches from internal matcher
+    std::vector<Matcher::p_match> getMatches () { return matcher->getMatches(); }
+    
+    // streams out the current transformation matrix Tr_delta 
+    friend std::ostream& operator<< (std::ostream &os,VisualOdometry &viso) {
+        Matrix p = viso.getMotion();
+        os << p.val[0][0] << " " << p.val[0][1] << " "  << p.val[0][2]  << " "  << p.val[0][3] << " ";
+        os << p.val[1][0] << " " << p.val[1][1] << " "  << p.val[1][2]  << " "  << p.val[1][3] << " ";
+        os << p.val[2][0] << " " << p.val[2][1] << " "  << p.val[2][2]  << " "  << p.val[2][3];
+        return os;
+    }
+    
+protected:
+
+    // 更新动作
+    bool updateMotion ();
+
+    // 计算位置变化矩阵
+    Matrix transformationVectorToMatrix (std::vector<double> tr);
+
+    // 预测动作
+    virtual std::vector<double> estimateMotion (std::vector<Matcher::p_match> p_matched) = 0;
+    
+    // 获得一个随机取样
+    std::vector<int32_t> getRandomSample (int32_t N,int32_t num);
+
+    Matrix                         Tr_delta;   // transformation (previous -> current frame)  
+    bool                           Tr_valid;   // motion estimate exists?
+    Matcher                       *matcher;    // feature matcher
+    std::vector<int32_t>           inliers;    // inlier set
+    double                        *J;          // jacobian
+    double                        *p_observe;  // observed 2d points
+    double                        *p_predict;  // predicted 2d points
+    std::vector<Matcher::p_match>  p_matched;  // feature point matches
+  
+private:
+  
+    parameters                    param;     // common parameters
+};
+    \end{minted}
+    \subsubsection{Matcher}
+    提供维护一个ringbuffer，计算输入图片特征值，对特征值进行匹配，进行环形比配，对匹配结果进行桶操作，优化，去除无效值等
+    特征计算以及匹配相关操作
+    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
+class Matcher {
+
+public:
+
+    // 各项参数
+    struct parameters {
+    
+        int32_t nms_n;                  // non-max-suppression: min. distance between maxima (in pixels)
+        int32_t nms_tau;                // non-max-suppression: interest point peakiness threshold
+        int32_t match_binsize;          // matching bin width/height (affects efficiency only)
+        int32_t match_radius;           // matching radius (du/dv in pixels)
+        int32_t match_disp_tolerance;   // dv tolerance for stereo matches (in pixels)
+        int32_t outlier_disp_tolerance; // outlier removal: disparity tolerance (in pixels)
+        int32_t outlier_flow_tolerance; // outlier removal: flow tolerance (in pixels)
+        int32_t multi_stage;            // 0=disabled,1=multistage matching (denser and faster)
+        int32_t half_resolution;        // 0=disabled,1=match at half resolution, refine at full resolution
+        int32_t refinement;             // refinement (0=none,1=pixel,2=subpixel)
+        double  f,cu,cv,base;           // calibration (only for match prediction)
+        
+        parameters () {
+            ...
+        }
+    };
+
+    // 记录环形匹配完成后比配的四个点
+    struct p_match {
+        float   u1p,v1p; // u,v-coordinates in previous left  image
+        int32_t i1p;     // feature index (for tracking)
+        float   u2p,v2p; // u,v-coordinates in previous right image
+        int32_t i2p;     // feature index (for tracking)
+        float   u1c,v1c; // u,v-coordinates in current  left  image
+        int32_t i1c;     // feature index (for tracking)
+        float   u2c,v2c; // u,v-coordinates in current  right image
+        int32_t i2c;     // feature index (for tracking)
+    };
+
+    // 读入一帧两张照片并且计算特征值
+    void pushBack (uint8_t *I1,uint8_t* I2,int32_t* dims,const bool replace);
+    
+    // 匹配特征值
+    void matchFeatures(int32_t method, Matrix *Tr_delta = 0);
+
+    // 进行“桶”操作
+    void bucketFeatures(int32_t max_features,float bucket_width,float bucket_height);
+
+    // return vector with matched feature points and indices
+    std::vector<Matcher::p_match> getMatches() { return p_matched_2; }
+
+    private:
+
+    // structure for storing interest points
+    struct maximum {
+        int32_t u;   // u-coordinate
+        int32_t v;   // v-coordinate
+        int32_t val; // value
+        int32_t c;   // class
+        int32_t d1,d2,d3,d4,d5,d6,d7,d8; // descriptor
+        maximum() {}
+        maximum(int32_t u,int32_t v,int32_t val,int32_t c):u(u),v(v),val(val),c(c) {}
+    };
+    
+    // 记录统计出的搜索范围
+    struct range {
+        float u_min[4];
+        float u_max[4];
+        float v_min[4];
+        float v_max[4];
+    };
+    
+    // 统计每个匹配点位置在不同图中的变化值
+    struct delta {
+        float val[8];
+        delta () {}
+        delta (float v) {
+        for (int32_t i=0; i<8; i++)
+            val[i] = v;
+        }
+    };
+    
+    // 非极大值抑制
+    void nonMaximumSuppression (int16_t* I_f1,int16_t* I_f2,const int32_t* dims,std::vector<Matcher::maximum> &maxima,int32_t nms_n);
+
+    // descriptor functions
+    inline uint8_t saturate(int16_t in);
+    void filterImageAll (uint8_t* I,uint8_t* I_du,uint8_t* I_dv,int16_t* I_f1,int16_t* I_f2,const int* dims);
+    void filterImageSobel (uint8_t* I,uint8_t* I_du,uint8_t* I_dv,const int* dims);
+    inline void computeDescriptor (const uint8_t* I_du,const uint8_t* I_dv,const int32_t &bpl,const int32_t &u,const int32_t &v,uint8_t *desc_addr);
+    inline void computeSmallDescriptor (const uint8_t* I_du,const uint8_t* I_dv,const int32_t &bpl,const int32_t &u,const int32_t &v,uint8_t *desc_addr);
+    void computeDescriptors (uint8_t* I_du,uint8_t* I_dv,const int32_t bpl,std::vector<Matcher::maximum> &maxima);
+    
+    void getHalfResolutionDimensions(const int32_t *dims,int32_t *dims_half);
+    uint8_t* createHalfResolutionImage(uint8_t *I,const int32_t* dims);
+
+    // 计算图片特征
+    void computeFeatures (uint8_t *I,const int32_t* dims,int32_t* &max1,int32_t &num1,int32_t* &max2,int32_t &num2,uint8_t* &I_du,uint8_t* &I_dv,uint8_t* &I_du_full,uint8_t* &I_dv_full);
+
+    void computePriorStatistics (std::vector<Matcher::p_match> &p_matched,int32_t method);
+    void createIndexVector (int32_t* m,int32_t n,std::vector<int32_t> *k,const int32_t &u_bin_num,const int32_t &v_bin_num);
+    inline void findMatch (int32_t* m1,const int32_t &i1,int32_t* m2,const int32_t &step_size, std::vector<int32_t> *k2,const int32_t &u_bin_num,const int32_t &v_bin_num,const int32_t &stat_bin, int32_t& min_ind,int32_t stage,bool flow,bool use_prior,double u_=-1,double v_=-1);
+    void matching (int32_t *m1p,int32_t *m2p,int32_t *m1c,int32_t *m2c, int32_t n1p,int32_t n2p,int32_t n1c,int32_t n2c, std::vector<Matcher::p_match> &p_matched,int32_t method,bool use_prior,Matrix *Tr_delta = 0);
+
+    void removeOutliers (std::vector<Matcher::p_match> &p_matched,int32_t method);
+
+    void refinement (std::vector<Matcher::p_match> &p_matched,int32_t method);
+
+    // parameters
+    parameters param;
+    int32_t    margin;
+    
+    ...
+};
+
+    \end{minted}
+    \subsection{主要函数过程分析}
     \subsubsection{demo程序分析}
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 VisualOdometryStereo::parameters param;
@@ -44,46 +326,8 @@ cout << " ... failed!" << endl;
 }
     \end{minted}
     分别从从左右镜头读入一帧，把图片中的信息存入数组，调用VisualOdemetryStereo的process方法进行处理，处理完成后输出匹配成功的点，内围点的占比和当前摄像机的姿态
-    \subsubsection{主要类分析}
-    \paragraph{VisualOdomentry简要分析}
-    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
-class VisualOdometry {
-public:
-    //相机校准参数
-    struct calibration {  
-       ...
-    };
-  
-    // bucketing 参数
-    struct bucketing {  
-      ...
-    };
-  
-    // 参数
-    struct parameters {
-    };
-protected:
-    Matrix                         Tr_delta;   // 姿态变换
-    bool                           Tr_valid;   // 是否存在预测的下一帧
-    Matcher                       *matcher;    // feature matcher
-    std::vector<int32_t>           inliers;    // 内围点
-    double                        *J;          // 雅克比行列式
-    double                        *p_observe;  // 观测点的二维坐标
-    double                        *p_predict;  // 预测点的二维坐标
-    std::vector<Matcher::p_match>  p_matched;  // feature point matches
-    
-private:
-    
-    parameters                    param;     // 参数
-}
-    \end{minted}
-    \paragraph{VisualOdometryStereo简要分析}
-    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
-class VisualOdometryStereo {
-    % TODO
-}
-    \end{minted}
-    \subsubsection{主要过程分析}
+    \subsubsection{VisualOdometryStereo::process}
+    输入一帧左右两张图像，存入ringbuffer，计算特征，匹配特征值，进行“桶”操作，最后更新动作
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 bool VisualOdometryStereo::process (uint8_t *I1,uint8_t *I2,int32_t* dims,bool replace) {
 
@@ -109,14 +353,7 @@ bool VisualOdometryStereo::process (uint8_t *I1,uint8_t *I2,int32_t* dims,bool r
 }
         
     \end{minted}
-    \paragraph{Matcher类分析}
-    \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
-
-    \end{minted}
-    \subsection{局部模块分析}
-    \subsubsection{功能类分析}
-    \subsubsection{功能函数分析}
-    \paragraph{Matcher::pushBack} 
+    \subsubsection{Matcher::pushBack} 
         把左右各一帧图像放入ringbuffer，并且计算两张图像的各个特征
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 void Matcher::pushBack (uint8_t *I1,uint8_t* I2,int32_t* dims,const bool replace) {
@@ -154,7 +391,8 @@ void Matcher::pushBack (uint8_t *I1,uint8_t* I2,int32_t* dims,const bool replace
         computeFeatures(I2c,dims_c,m2c1,n2c1,m2c2,n2c2,I2c_du,I2c_dv,I2c_du_full,I2c_dv_full);
     }
     \end{minted}
-    \paragraph{Matcher::computeFeatures}
+    \subsubsection{Matcher::computeFeatures}
+    用各个滤波器提取图片的特征值，进行非极大化抑制，计算出稀疏特征以及稠密特征
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 void Matcher::computeFeatures (...) {
   
@@ -205,9 +443,9 @@ void Matcher::computeFeatures (...) {
 }
 
     \end{minted}
-    \paragraph{Matcher::matchFeatures}
+    \subsubsection{Matcher::matchFeatures}
     
-    匹配特征值
+    匹配特征值, 首先匹配稀疏特征值，消除异常值后计算出搜索范围，然后利用搜索范围进行稠密特征匹配，并且进行精化，消除异常值
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 void Matcher::matchFeatures(int32_t method, Matrix *Tr_delta) {
 
@@ -237,13 +475,10 @@ void Matcher::matchFeatures(int32_t method, Matrix *Tr_delta) {
     }
 }
     \end{minted}
-    \paragraph{Matcher::matching}
+    \subsubsection{Matcher::matching}
+    对当前4张图片使用环形匹配
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
-void Matcher::matching (int32_t *m1p,int32_t *m2p,int32_t *m1c,int32_t *m2c,
-                        int32_t n1p,int32_t n2p,int32_t n1c,int32_t n2c,
-                        vector<Matcher::p_match> &p_matched,int32_t method,bool use_prior,Matrix *Tr_delta) {
-
-    
+void Matcher::matching (int32_t *m1p,int32_t *m2p,int32_t *m1c,int32_t *m2c, int32_t n1p,int32_t n2p,int32_t n1c,int32_t n2c, vector<Matcher::p_match> &p_matched,int32_t method,bool use_prior,Matrix *Tr_delta) {
     
     // loop variables
     int32_t* M = (int32_t*)calloc(dims_c[0]*dims_c[1],sizeof(int32_t));
@@ -343,6 +578,8 @@ void Matcher::matching (int32_t *m1p,int32_t *m2p,int32_t *m1c,int32_t *m2c,
     ...
 }
     \end{minted}
+    \subsubsection{Matcher::bucketFeatures}
+    对匹配完成的结果进行“桶”操作，对每个局部区域只随机保留若干个特征点
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 void Matcher::bucketFeatures(int32_t max_features,float bucket_width,float bucket_height) {
 
@@ -387,6 +624,8 @@ void Matcher::bucketFeatures(int32_t max_features,float bucket_width,float bucke
     delete []buckets;
 }        
     \end{minted}
+    \subsubsection{Matcher::computePriorStatistics}
+    分析偏移结果，统计每个区域最大偏移量，为下一部稠密特征匹配约束搜索范围
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 void Matcher::computePriorStatistics (vector<Matcher::p_match> &p_matched,int32_t method) {
     
@@ -493,6 +732,8 @@ void Matcher::computePriorStatistics (vector<Matcher::p_match> &p_matched,int32_
     delete []delta_accu;
 }
     \end{minted}
+    \subsubsection{VisualOdometry::updateMotion}
+    计算主体动作，并将其转换为矩阵
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 bool VisualOdometry::updateMotion () {
   
@@ -511,6 +752,8 @@ bool VisualOdometry::updateMotion () {
   return true;
 }
     \end{minted}
+    \subsubsection{VisualOdometryStereo::estimateMotion}
+    使用RANSAC算法计算最优的投影参数
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 vector<double> VisualOdometryStereo::estimateMotion (vector<Matcher::p_match> p_matched) {
 
@@ -613,6 +856,8 @@ vector<double> VisualOdometryStereo::estimateMotion (vector<Matcher::p_match> p_
     else         return vector<double>();
 }
     \end{minted}
+    \subsubsection{VisualOdometryStereo::updateParameters}
+    迭代计算投影和动作参数，返回当前参数迭代成功，收敛，或失败
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 VisualOdometryStereo::result VisualOdometryStereo::updateParameters(vector<Matcher::p_match> &p_matched,vector<int32_t> &active,vector<double> &tr,double step_size,double eps) {
     
@@ -664,6 +909,8 @@ VisualOdometryStereo::result VisualOdometryStereo::updateParameters(vector<Match
     }
 }
     \end{minted}
+    \subsubsection{VisualOdometryStereo::getInlier}
+    对每个特征点使用当前模型进行匹配，把观测和预计的差别小于阈值的点加入inlier中
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 vector<int32_t> VisualOdometryStereo::getInlier(vector<Matcher::p_match> &p_matched,vector<double> &tr) {
 
@@ -684,6 +931,8 @@ vector<int32_t> VisualOdometryStereo::getInlier(vector<Matcher::p_match> &p_matc
     return inliers;
 }
     \end{minted}
+    \subsubsection{VisualOdometryStereo::transformationVectorToMatrix}
+    将移动向量转化为矩阵
     \begin{minted}[linenos, breaklines, breakanywhere, mathescape]{c++}
 Matrix VisualOdometry::transformationVectorToMatrix (vector<double> tr) {
 
@@ -699,4 +948,23 @@ Matrix VisualOdometry::transformationVectorToMatrix (vector<double> tr) {
 }
     \end{minted}
     \section{实验运行结果}
+    libviso2有matlab warpper版本也有c++原生版本，我们这里运行了两个demo
+    \subsection{MATLAB版本}
+    使用matlab运行mex.m进行编译，再运行demo\_viso\_steroe.m运行demo程序，结果如图4
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.8\textwidth]{img/matlab.png} 
+        \caption{matlab版程序运行结果}
+        \label{fig.4}
+    \end{figure}
+    程序试试显示当前匹配点的数量，inlier的比例，和主体的运动轨迹
+    \subsection{c++版本}
+    使用cmake生成makefile，通过make进行编译，然后下载官网上的demo进行测试，结果如图5
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.6\textwidth]{img/c++.png} 
+        \caption{c++版程序运行的结果}
+        \label{fig.5}
+    \end{figure}
+    输出的结果与matlab版本相似，但是会直接输出位置矩阵，不会输出轨迹
 \end{document}
