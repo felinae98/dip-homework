@@ -1,5 +1,5 @@
 clear;close all;clc
-im = imread("../example-grey-small.png");
+im = imread('./example-grey-small.png');
 % imshow(im);
 
 theta = pi / 6;

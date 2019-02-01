@@ -2,7 +2,7 @@ close all;
 clear;
 clc
 
-im = imread("../example-grey-small.png");
+im = imread('./example-grey-small.png');
 imshow(im);
 imd = im2double(im);
 dx_kernel = [-1, 0 1; -1. 0. 1; -1, 0, 1];
