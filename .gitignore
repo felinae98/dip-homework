@@ -494,3 +494,5 @@ dmypy.json
 libviso2/
 *_temp.tex
 *.zip
+require/
+summarize/papers
